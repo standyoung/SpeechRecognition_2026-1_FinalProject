@@ -20,8 +20,8 @@ import numpy as np
 import sample_util
 
 # TODO: Correct paths depending on your environment
-db_top_dir = ""
-train_top_dir = os.path.join(db_top_dir, "libri_light/1h")
+db_top_dir = "../data/"
+train_top_dir = os.path.join(db_top_dir, "1h")
 test_top_dir = os.path.join(db_top_dir, "test-clean")
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
 # End of ToDO
@@ -144,8 +144,9 @@ model = AutoModelForCTC.from_pretrained(
 # These control training hyperparameters and runtime behavior:
 training_args = TrainingArguments(
     # Directory to save model checkpoints and outputs.
-    output_dir="/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/"
-               "models/asr_stop_model_final",
+    # output_dir="/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/"
+    #            "models/asr_stop_model_final",
+    output_dir="./finetuning_output",
 
     # Batch size per device (GPU/CPU) for training.
     per_device_train_batch_size=16,
