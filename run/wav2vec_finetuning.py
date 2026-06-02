@@ -2,19 +2,19 @@
 from __future__ import (absolute_import, division, print_function,
                          unicode_literals)
 
-__author__ = "Chanwoo Kim(chanwcom@gmail.com)"
+__author__ = "Seoyoung Ju(jstandzero@korea.ac.kr)"
 
 # Standard imports
 import inspect
 import os
 
 # Third-party imports
-from transformers import AutoModelForCTC, AutoProcessor, TrainingArguments, Trainer
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
-import torch
+from typing import Dict, List, Union
 import evaluate
 import numpy as np
+import torch
+from transformers import AutoModelForCTC, AutoProcessor, Trainer, TrainingArguments
 
 # Custom imports
 import sample_util
@@ -29,37 +29,26 @@ test_top_dir = os.path.join(db_top_dir, "test-clean")
 processor = sample_util.processor
 # End of ToDO
 
+cuda_available = torch.cuda.is_available()
+if cuda_available:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 train_dataset = sample_util.make_dataset(train_top_dir)
 test_dataset = sample_util.make_dataset(test_top_dir)
 wer_metric = evaluate.load("wer")
 
 
 def compute_metrics(pred) -> Dict[str, float]:
-    """Compute word error rate (WER) between predictions and labels.
-
-    This function decodes the model's predicted token IDs and ground truth
-    label IDs into strings, replacing ignored label tokens with the padding
-    token ID. Then it computes WER using the `evaluate` library.
-
-    Args:
-        pred: A prediction object with attributes:
-            - predictions: logits or probabilities of shape
-                (batch_size, seq_len, vocab_size).
-            - label_ids: ground truth token IDs with padding replaced by -100.
-
-    Returns:
-        Dict[str, float]: Dictionary with WER under the key 'wer'.
-    """
+    """Compute word error rate (WER) between predictions and labels."""
     pred_logits = pred.predictions
     pred_ids = np.argmax(pred_logits, axis=-1)
 
-    # Replace -100 in labels with tokenizer pad token ID to enable decoding
     label_ids = pred.label_ids.copy()
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
     pred_str = processor.batch_decode(pred_ids)
     label_str = processor.batch_decode(label_ids, group_tokens=False)
-
     wer_score = wer_metric.compute(predictions=pred_str, references=label_str)
 
     return {"wer": wer_score}
@@ -67,18 +56,7 @@ def compute_metrics(pred) -> Dict[str, float]:
 
 @dataclass
 class DataCollatorCTCWithPadding:
-    """Data collator that dynamically pads input values and labels for CTC training.
-
-    This class pads the input audio features and the corresponding label sequences
-    (token IDs) to the length of the longest element in the batch. It also replaces
-    padding tokens in the labels with -100 to ensure they are ignored during the loss
-    computation, as required by PyTorch's CTC loss implementation.
-
-    Attributes:
-        processor (AutoProcessor): The processor used for feature extraction and tokenization.
-        padding (Union[bool, str]): Padding strategy. Defaults to "longest" to pad to the
-            longest sequence in the batch.
-    """
+    """Pad input audio and CTC labels dynamically for each batch."""
 
     processor: AutoProcessor
     padding: Union[bool, str] = "longest"
@@ -86,113 +64,63 @@ class DataCollatorCTCWithPadding:
     def __call__(
         self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
     ) -> Dict[str, torch.Tensor]:
-        """Pad inputs and labels in a batch for model training.
-
-        Args:
-            features: A list of feature dictionaries, each containing:
-                - "input_values": the audio features (list or tensor).
-                - "labels": the tokenized label sequence.
-
-        Returns:
-            A dictionary with padded input tensors and labels ready for the model:
-            - "input_values": Padded input audio feature tensor.
-            - "labels": Padded label tensor with padding tokens replaced by -100.
-        """
-        # Separate the input audio features and label sequences from the batch.
         input_features = [{"input_values": feature["input_values"]} for feature in features]
         label_features = [{"input_ids": feature["labels"]} for feature in features]
 
-        # Use the processor's pad method to pad input audio features to the same length.
         batch = self.processor.pad(
             input_features,
             padding=self.padding,
             return_tensors="pt"
         )
-
-        # Pad the label sequences separately using the processor's pad method.
         labels_batch = self.processor.tokenizer.pad(
             label_features,
             padding=self.padding,
             return_tensors="pt"
         )
-
-        # Replace padding tokens in labels with -100 so that the loss function ignores them.
         labels = labels_batch["input_ids"].masked_fill(
             labels_batch.attention_mask.ne(1), -100
         )
-
-        # Add the processed labels to the batch dictionary.
         batch["labels"] = labels
 
         return batch
 
-# Instantiate the data collator for CTC loss with padding support.
-# It dynamically pads the inputs and labels in each batch to the longest
-# sequence, enabling efficient batch processing without manual padding.
+
 data_collator = DataCollatorCTCWithPadding(
     processor=processor,
     padding="longest"
 )
 
-# Load the pretrained Wav2Vec2 model with CTC (Connectionist Temporal Classification)
-# head for speech recognition.
-# - ctc_loss_reduction="mean" averages the CTC loss over the batch.
-# - pad_token_id is set to the tokenizer's pad token to ensure correct masking.
 model = AutoModelForCTC.from_pretrained(
     sample_util.MODEL_NAME,
+    apply_spec_augment=False,
     ctc_loss_reduction="mean",
-    pad_token_id=processor.tokenizer.pad_token_id
+    ctc_zero_infinity=True,
+    ignore_mismatched_sizes=True,
+    pad_token_id=processor.tokenizer.pad_token_id,
+    use_safetensors=True,
+    vocab_size=len(processor.tokenizer)
 )
+model.config.apply_spec_augment = False
+model.freeze_feature_encoder()
 
 training_args_kwargs = {
-    # Directory to save model checkpoints and outputs.
-    # output_dir="/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/"
-    #            "models/asr_stop_model_final",
     "output_dir": os.path.join(PROJECT_DIR, "finetuning_output"),
-
-    # Batch size per device (GPU/CPU) for training.
-    "per_device_train_batch_size": 16,
-
-    # Number of batches to accumulate gradients over before updating model weights.
-    "gradient_accumulation_steps": 2,
-
-    # Initial learning rate for the optimizer.
+    "per_device_train_batch_size": 8,
+    "gradient_accumulation_steps": 4,
     "learning_rate": 1e-4,
-
-    # Number of warmup steps to gradually increase learning rate at start.
-    "warmup_steps": 500,
-
-    # Total number of training steps.
+    "warmup_steps": 100,
     "max_steps": 2000,
-
-    # Enable gradient checkpointing to reduce memory usage at the cost of extra compute.
     "gradient_checkpointing": True,
-
-    # Use mixed precision training (float16) to speed up training and reduce memory.
-    "fp16": torch.cuda.is_available(),
-
-    # Batch size per device during evaluation.
-    "per_device_eval_batch_size": 24,
-
-    # Save model checkpoints every N steps.
-    "save_steps": 2000,
-
-    # Run evaluation every N steps during training.
-    "eval_steps": 100,
-
-    # Log training progress every N steps.
-    "logging_steps": 25,
-
-    # Load the best model (lowest WER) at the end of training automatically.
+    "fp16": cuda_available and os.environ.get("ENABLE_FP16") == "1",
+    "dataloader_pin_memory": cuda_available,
+    "per_device_eval_batch_size": 8,
+    "save_steps": 500,
+    "eval_steps": 250,
+    "logging_steps": 10,
+    "remove_unused_columns": False,
     "load_best_model_at_end": True,
-
-    # Metric to use for selecting the best model checkpoint.
     "metric_for_best_model": "wer",
-
-    # Indicates that a lower metric score (WER) is better.
     "greater_is_better": False,
-
-    # Disable pushing model to the Hugging Face hub.
     "push_to_hub": False,
 }
 strategy_arg = (
@@ -202,11 +130,11 @@ strategy_arg = (
 )
 training_args_kwargs[strategy_arg] = "steps"
 
+# TODO
 # Define the training arguments for the Hugging Face Trainer.
 # These control training hyperparameters and runtime behavior:
 training_args = TrainingArguments(**training_args_kwargs)
 
-# TODO
 # Create the Trainer instance to handle training and evaluation.
 # This ties together the model, datasets, processor/data collator, and metrics.
 trainer_kwargs = {
@@ -226,6 +154,7 @@ elif "tokenizer" in trainer_signature:
 trainer = Trainer(**trainer_kwargs)
 # End of TODO
 
-trainer.train()
-trainer.save_model(training_args.output_dir)
-processor.save_pretrained(training_args.output_dir)
+if __name__ == "__main__":
+    trainer.train()
+    trainer.save_model(training_args.output_dir)
+    processor.save_pretrained(training_args.output_dir)

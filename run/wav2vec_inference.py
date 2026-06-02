@@ -2,7 +2,7 @@
 from __future__ import (absolute_import, division, print_function,
                          unicode_literals)
 
-__author__ = "Chanwoo Kim(chanwcom@gmail.com)"
+__author__ = "Seoyoung Ju(jstandzero@korea.ac.kr)"
 
 # Standard imports
 import os
@@ -17,7 +17,6 @@ RUN_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(RUN_DIR)
 
 db_top_dir = os.path.join(PROJECT_DIR, "data")
-
 test_clean_top_dir = os.path.join(db_top_dir, "test-clean")
 test_other_top_dir = os.path.join(db_top_dir, "test-other")
 
@@ -29,7 +28,7 @@ test_other_dataset = sample_util.make_dataset(test_other_top_dir)
 default_model_dir = os.path.join(PROJECT_DIR, "finetuning_output")
 model_dir = os.environ.get("WAV2VEC_MODEL_DIR", default_model_dir)
 if not os.path.exists(os.path.join(model_dir, "config.json")):
-    model_dir = sample_util.MODEL_NAME
+    model_dir = sample_util.PROCESSOR_NAME
 
 transcriber = pipeline(
     "automatic-speech-recognition",
@@ -39,8 +38,9 @@ transcriber = pipeline(
 )
 # End of TODO
 
-# Function to write REF/HYP pairs to a file
+
 def write_results(dataset, transcriber, output_file):
+    """Write REF/HYP pairs for a dataset."""
     with open(output_file, "w", encoding="utf-8") as f:
         for data in dataset:
             ref = sample_util.processor.decode(data["labels"], group_tokens=False)
@@ -53,16 +53,14 @@ def write_results(dataset, transcriber, output_file):
             )["text"]
             # End of TODO
             f.write(f"REF: {ref}\n")
-            f.write(f"HYP: {hyp}\n\n")  # double newline for readability
+            f.write(f"HYP: {hyp}\n\n")
 
-# Write test_clean_dataset
+
 write_results(
     test_clean_dataset,
     transcriber,
     os.path.join(PROJECT_DIR, "test_clean_result.txt")
 )
-
-# Write test_other_dataset
 write_results(
     test_other_dataset,
     transcriber,
