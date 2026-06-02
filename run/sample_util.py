@@ -12,6 +12,7 @@ import re
 from typing import Dict
 
 # Third-party imports
+import torch
 import torchaudio
 import webdataset as wds
 from transformers import AutoProcessor
@@ -45,7 +46,22 @@ def preprocess_sample(sample: Dict) -> Dict:
     if isinstance(audio, tuple):
         waveform, sampling_rate = audio
     else:
-        waveform, sampling_rate = torchaudio.load(io.BytesIO(audio))
+        try:
+            import soundfile as sf
+            audio_array, sampling_rate = sf.read(
+                io.BytesIO(audio),
+                dtype="float32",
+                always_2d=True
+            )
+            waveform = torch.from_numpy(audio_array).transpose(0, 1)
+        except (ImportError, OSError, RuntimeError):
+            try:
+                waveform, sampling_rate = torchaudio.load(io.BytesIO(audio))
+            except (OSError, RuntimeError) as exc:
+                raise RuntimeError(
+                    "Audio decoding failed. soundfile could not decode the bytes, "
+                    "and torchaudio could not load TorchCodec/FFmpeg."
+                ) from exc
 
     waveform = waveform.detach().cpu().float()
     if waveform.ndim > 1:
