@@ -208,16 +208,22 @@ training_args = TrainingArguments(**training_args_kwargs)
 
 # TODO
 # Create the Trainer instance to handle training and evaluation.
-# This ties together the model, datasets, tokenizer, data collator, and metrics.
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    tokenizer=processor.feature_extractor,
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-)
+# This ties together the model, datasets, processor/data collator, and metrics.
+trainer_kwargs = {
+    "model": model,
+    "args": training_args,
+    "train_dataset": train_dataset,
+    "eval_dataset": test_dataset,
+    "data_collator": data_collator,
+    "compute_metrics": compute_metrics,
+}
+trainer_signature = inspect.signature(Trainer.__init__).parameters
+if "processing_class" in trainer_signature:
+    trainer_kwargs["processing_class"] = processor
+elif "tokenizer" in trainer_signature:
+    trainer_kwargs["tokenizer"] = processor.feature_extractor
+
+trainer = Trainer(**trainer_kwargs)
 # End of TODO
 
 trainer.train()
