@@ -243,6 +243,7 @@ python run/evaluate_wer.py test_other_result.txt
 | Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | 0.2184 | 0.2948 | frozen encoder layers |
 | Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | 0.2232 | 0.3293 | maximum entropy regularization |
 | Ablation 4 | default CTC fine-tuning | `--rescore-model gpt2` | TBD | TBD | GPT-2 neural LM rescoring |
+| Ablation 1+2+3+4 | `--augment` + `--freeze-transformer-layers 6` + `--max-entropy-weight 0.01` | `--rescore-model gpt2` | TBD | TBD | combined training + decoding setting |
 
 ### Ablation 학습 명령어
 

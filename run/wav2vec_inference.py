@@ -176,11 +176,7 @@ def ctc_prefix_beam_search(
         key=lambda item: logadd(item[1][0], item[1][1]),
         reverse=True
     ):
-        text = processor.decode(
-            list(prefix),
-            group_tokens=False,
-            skip_special_tokens=True
-        ).strip()
+        text = processor.batch_decode([list(prefix)])[0].strip()
         if text in seen:
             continue
         seen.add(text)
