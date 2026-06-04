@@ -108,6 +108,9 @@ def ctc_prefix_beam_search(
     blank_id = processor.tokenizer.pad_token_id
     special_token_ids = set(getattr(processor.tokenizer, "all_special_ids", []))
     special_token_ids.discard(blank_id)
+    word_delimiter_id = getattr(processor.tokenizer, "word_delimiter_token_id", None)
+    if word_delimiter_id is not None:
+        special_token_ids.discard(word_delimiter_id)
     beams = {(): (0.0, -math.inf)}
 
     for frame in log_probs:
