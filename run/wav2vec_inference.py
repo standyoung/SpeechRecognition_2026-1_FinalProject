@@ -8,7 +8,8 @@ __author__ = "Seoyoung Ju(jstandzero@korea.ac.kr)"
 import os
 
 # Third-party imports
-from transformers import pipeline
+import torch
+from transformers import AutoModelForCTC, AutoProcessor
 
 # Custom imports
 import sample_util
@@ -30,27 +31,42 @@ model_dir = os.environ.get("WAV2VEC_MODEL_DIR", default_model_dir)
 if not os.path.exists(os.path.join(model_dir, "config.json")):
     model_dir = sample_util.PROCESSOR_NAME
 
-transcriber = pipeline(
-    "automatic-speech-recognition",
-    model=model_dir,
-    tokenizer=model_dir,
-    feature_extractor=model_dir,
-)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+processor = AutoProcessor.from_pretrained(model_dir)
+model = AutoModelForCTC.from_pretrained(model_dir).to(device)
+model.eval()
 # End of TODO
 
 
-def write_results(dataset, transcriber, output_file):
+def transcribe(data):
+    """Transcribe one preprocessed sample without using the ASR pipeline."""
+    inputs = processor(
+        data["speech"],
+        sampling_rate=data["sampling_rate"],
+        return_tensors="pt"
+    )
+    input_values = inputs.input_values.to(device)
+    attention_mask = getattr(inputs, "attention_mask", None)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+    with torch.no_grad():
+        logits = model(
+            input_values,
+            attention_mask=attention_mask
+        ).logits
+
+    pred_ids = torch.argmax(logits, dim=-1)
+    return processor.batch_decode(pred_ids)[0]
+
+
+def write_results(dataset, output_file):
     """Write REF/HYP pairs for a dataset."""
     with open(output_file, "w", encoding="utf-8") as f:
         for data in dataset:
-            ref = sample_util.processor.decode(data["labels"], group_tokens=False)
+            ref = processor.decode(data["labels"], group_tokens=False)
             # TODO complete the following part
-            hyp = transcriber(
-                {
-                    "array": data["speech"],
-                    "sampling_rate": data["sampling_rate"],
-                }
-            )["text"]
+            hyp = transcribe(data)
             # End of TODO
             f.write(f"REF: {ref}\n")
             f.write(f"HYP: {hyp}\n\n")
@@ -58,11 +74,9 @@ def write_results(dataset, transcriber, output_file):
 
 write_results(
     test_clean_dataset,
-    transcriber,
     os.path.join(PROJECT_DIR, "test_clean_result.txt")
 )
 write_results(
     test_other_dataset,
-    transcriber,
     os.path.join(PROJECT_DIR, "test_other_result.txt")
 )
