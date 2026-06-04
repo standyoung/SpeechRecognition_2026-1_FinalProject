@@ -241,7 +241,7 @@ python run/evaluate_wer.py test_other_result.txt
 | Baseline | default CTC fine-tuning | greedy decoding | 0.2364 | 0.3459 | `wav2vec2 CTC greedy decoding` |
 | Ablation 1 | `--augment` | greedy decoding | 0.2244 | 0.3283 | data augmentation |
 | Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | 0.2184 | 0.2948 | frozen encoder layers |
-| Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | TBD | TBD | maximum entropy regularization |
+| Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | 0.2232 | 0.3293 | maximum entropy regularization |
 | Ablation 4 | default CTC fine-tuning | `--rescore-model gpt2` | TBD | TBD | GPT-2 neural LM rescoring |
 
 ### Ablation 학습 명령어
@@ -280,8 +280,8 @@ CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
   --token-beam 20 \
   --nbest-size 10 \
   --rescore-alpha 0.5 \
-  --test-clean-output results/gpt2_rescore_test_clean.txt \
-  --test-other-output results/gpt2_rescore_test_other.txt
+  --test-clean-output results/baseline_gpt2_rescore_test_clean.txt \
+  --test-other-output results/baseline_gpt2_rescore_test_other.txt
 ```
 
 ### Baseline: wav2vec2 CTC greedy decoding
