@@ -11,11 +11,20 @@ import os
 import torch
 from transformers import AutoModelForCTC, AutoProcessor
 
-# Custom imports
-import sample_util
-
 RUN_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(RUN_DIR)
+default_model_dir = os.path.join(PROJECT_DIR, "finetuning_output")
+model_dir = os.environ.get("WAV2VEC_MODEL_DIR", default_model_dir)
+if not os.path.exists(os.path.join(model_dir, "config.json")):
+    model_dir = os.environ.get(
+        "WAV2VEC_PROCESSOR_NAME",
+        "facebook/wav2vec2-base-960h"
+    )
+else:
+    os.environ.setdefault("WAV2VEC_PROCESSOR_NAME", model_dir)
+
+# Custom imports
+import sample_util
 
 db_top_dir = os.path.join(PROJECT_DIR, "data")
 test_clean_top_dir = os.path.join(db_top_dir, "test-clean")
@@ -25,11 +34,6 @@ test_other_top_dir = os.path.join(db_top_dir, "test-other")
 # TODO Complete the following parts:
 test_clean_dataset = sample_util.make_dataset(test_clean_top_dir)
 test_other_dataset = sample_util.make_dataset(test_other_top_dir)
-
-default_model_dir = os.path.join(PROJECT_DIR, "finetuning_output")
-model_dir = os.environ.get("WAV2VEC_MODEL_DIR", default_model_dir)
-if not os.path.exists(os.path.join(model_dir, "config.json")):
-    model_dir = sample_util.PROCESSOR_NAME
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 processor = AutoProcessor.from_pretrained(model_dir)
