@@ -239,8 +239,8 @@ python run/evaluate_wer.py test_other_result.txt
 | Experiment | Training option | Decoding option | test-clean WER | test-other WER | Notes |
 | --- | --- | --- | ---: | ---: | --- |
 | Baseline | default CTC fine-tuning | greedy decoding | 0.2364 | 0.3459 | `wav2vec2 CTC greedy decoding` |
-| Ablation 1 | `--augment` | greedy decoding | TBD | TBD | data augmentation |
-| Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | TBD | TBD | frozen encoder layers |
+| Ablation 1 | `--augment` | greedy decoding | 0.2244 | 0.3283 | data augmentation |
+| Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | 0.2184 | 0.2948 | frozen encoder layers |
 | Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | TBD | TBD | maximum entropy regularization |
 | Ablation 4 | default CTC fine-tuning | `--rescore-model gpt2` | TBD | TBD | GPT-2 neural LM rescoring |
 
