@@ -285,6 +285,30 @@ CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
   --test-other-output results/baseline_gpt2_rescore_test_other.txt
 ```
 
+### All combined: Ablation 1 + 2 + 3 + 4
+
+아래 명령은 data augmentation, frozen encoder layers, maximum entropy regularization, GPT-2 neural LM rescoring을 모두 함께 적용하는 조합 실험이다.
+
+```bash
+# Train with Ablation 1 + 2 + 3
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --augment \
+  --freeze-transformer-layers 6 \
+  --max-entropy-weight 0.01 \
+  --output-dir finetuning_output_all
+
+# Inference with Ablation 4 on the combined checkpoint
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
+  --model-dir finetuning_output_all \
+  --rescore-model gpt2 \
+  --beam-width 25 \
+  --token-beam 20 \
+  --nbest-size 10 \
+  --rescore-alpha 0.5 \
+  --test-clean-output results/all_test_clean.txt \
+  --test-other-output results/all_test_other.txt
+```
+
 ### Baseline: wav2vec2 CTC greedy decoding
 
 기본 fine-tuning 설정으로 학습한 뒤, 외부 language model 없이 CTC greedy decoding으로 추론한다.
