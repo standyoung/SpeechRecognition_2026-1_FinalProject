@@ -109,7 +109,7 @@ tf32 = True on CUDA
 
 feature encoder는 `model.freeze_feature_encoder()`로 freeze한다. 1h fine-tuning처럼 데이터가 작은 경우 low-level acoustic feature extractor를 고정하면 학습 안정성이 좋아진다.
 
-fp16은 기본적으로 끄고 fp32 + TF32로 학습한다. fp16을 실험하려면 `ENABLE_FP16=1`을 설정한다.
+fp16은 기본적으로 끄고 fp32 + TF32로 학습한다. fp16을 실험하려면 `--fp16` argument를 사용한다.
 
 ## Evaluation 방법
 
@@ -182,7 +182,7 @@ CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py
 fp16 실험:
 
 ```bash
-CUDA_VISIBLE_DEVICES=5 ENABLE_FP16=1 python run/wav2vec_finetuning.py
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py --fp16
 ```
 
 추론:
@@ -204,4 +204,164 @@ python run/evaluate_wer.py test_other_result.txt
 - `facebook/wav2vec2-base`를 CTC 모델로 로드하면 `lm_head`가 `MISSING`으로 표시된다. 이는 CTC output head가 새로 초기화된다는 뜻이며 fine-tuning 대상이다.
 - pretraining용 quantizer/projection weight가 `UNEXPECTED`로 표시되는 것은 CTC 학습에서 사용하지 않는 weight가 checkpoint에 있기 때문이다.
 - `loss=0`, `grad_norm=nan`이 같이 나오면 정상 학습이 아니므로 run을 중단하고 기본 fp32 설정과 `apply_spec_augment=False` 설정을 확인한다.
-- TODO 주석은 과제 템플릿 맥락을 유지하기 위해 코드에 남겨두었다.
+- ablation study를 위해 주요 실험 옵션은 command line argument로 제어한다.
+
+## Baseline 요약
+
+`run/` 폴더의 현재 baseline은 `facebook/wav2vec2-base`에서 시작해 LibriSpeech 1h shard로 CTC fine-tuning을 수행하는 구성이다.
+
+- `facebook/wav2vec2-base` checkpoint를 acoustic model 초기값으로 사용한다.
+- grapheme 기반 tokenizer/processor를 사용해 transcript를 CTC label로 변환한다.
+- `AutoModelForCTC`로 CTC head를 붙이고 fine-tuning한다.
+- fine-tuned model과 processor는 `finetuning_output/`에 저장한다.
+- 저장된 모델로 `test-clean`, `test-other`를 추론해 `test_clean_result.txt`, `test_other_result.txt`를 생성한다.
+- `run/evaluate_wer.py`로 REF/HYP 결과 파일의 WER를 계산한다.
+
+## Baseline 결과
+
+```bash
+python run/evaluate_wer.py test_clean_result.txt
+# WER: 0.2364
+
+python run/evaluate_wer.py test_other_result.txt
+# WER: 0.3459
+```
+
+| Evaluation set | WER |
+| --- | ---: |
+| test-clean | 0.2364 |
+| test-other | 0.3459 |
+
+## Ablation Study 계획
+
+다음 실험은 같은 train/evaluation split을 사용하고, `test-clean`과 `test-other` WER를 비교한다. 아무 ablation option도 주지 않고 `python run/wav2vec_finetuning.py`를 실행하면 기본 설정이 baseline이다. 결과 파일명과 output directory를 분리해두면 실험별 결과를 쉽게 업데이트할 수 있다.
+
+| Experiment | Training option | Decoding option | test-clean WER | test-other WER | Notes |
+| --- | --- | --- | ---: | ---: | --- |
+| Baseline | default CTC fine-tuning | greedy decoding | 0.2364 | 0.3459 | `wav2vec2 CTC greedy decoding` |
+| Ablation 1 | `--augment` | greedy decoding | TBD | TBD | data augmentation |
+| Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | TBD | TBD | frozen encoder layers |
+| Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | TBD | TBD | maximum entropy regularization |
+| Ablation 4 | default CTC fine-tuning | `--rescore-model gpt2` | TBD | TBD | GPT-2 neural LM rescoring |
+
+### Ablation 학습 명령어
+
+Baseline은 추가 option 없이 학습한다. 각 ablation은 output directory를 다르게 저장해 checkpoint와 결과를 분리한다.
+
+```bash
+# Baseline: wav2vec2 CTC greedy decoding
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --output-dir finetuning_output_baseline
+
+# Ablation 1: + data augmentation
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --augment \
+  --output-dir finetuning_output_aug
+
+# Ablation 2: + frozen encoder layers
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --freeze-transformer-layers 6 \
+  --output-dir finetuning_output_freeze6
+
+# Ablation 3: + maximum entropy regularization
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --max-entropy-weight 0.01 \
+  --output-dir finetuning_output_maxent001
+```
+
+GPT-2 neural LM rescoring은 학습 ablation이 아니라 decoding ablation이므로, baseline checkpoint를 사용해 inference 단계에서 적용한다.
+
+```bash
+# Ablation 4: + GPT-2 neural LM rescoring
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
+  --model-dir finetuning_output_baseline \
+  --rescore-model gpt2 \
+  --beam-width 25 \
+  --token-beam 20 \
+  --nbest-size 10 \
+  --rescore-alpha 0.5 \
+  --test-clean-output results/gpt2_rescore_test_clean.txt \
+  --test-other-output results/gpt2_rescore_test_other.txt
+```
+
+### Baseline: wav2vec2 CTC greedy decoding
+
+기본 fine-tuning 설정으로 학습한 뒤, 외부 language model 없이 CTC greedy decoding으로 추론한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --output-dir finetuning_output_baseline
+
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
+  --model-dir finetuning_output_baseline \
+  --test-clean-output results/baseline_test_clean.txt \
+  --test-other-output results/baseline_test_other.txt
+```
+
+### Ablation 1: data augmentation
+
+학습 sample에 noise injection과 speed perturbation을 적용한다. Evaluation과 inference에는 augmentation을 적용하지 않는다.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --augment \
+  --output-dir finetuning_output_aug
+
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
+  --model-dir finetuning_output_aug \
+  --test-clean-output results/aug_test_clean.txt \
+  --test-other-output results/aug_test_other.txt
+```
+
+### Ablation 2: frozen encoder layers
+
+feature encoder는 기본적으로 freeze하고, 추가로 Wav2Vec2 transformer encoder 앞쪽 layer 일부를 freeze한다. 기본 실험값은 6개 layer로 둔다.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --freeze-transformer-layers 6 \
+  --output-dir finetuning_output_freeze6
+
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
+  --model-dir finetuning_output_freeze6 \
+  --test-clean-output results/freeze6_test_clean.txt \
+  --test-other-output results/freeze6_test_other.txt
+```
+
+### Ablation 3: maximum entropy regularization
+
+CTC loss에 prediction entropy를 높이는 regularization term을 추가한다. `--max-entropy-weight`가 0보다 클 때만 적용된다.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_finetuning.py \
+  --max-entropy-weight 0.01 \
+  --output-dir finetuning_output_maxent001
+
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
+  --model-dir finetuning_output_maxent001 \
+  --test-clean-output results/maxent001_test_clean.txt \
+  --test-other-output results/maxent001_test_other.txt
+```
+
+### Ablation 4: GPT-2 neural LM rescoring
+
+기본 CTC 모델의 logits에서 N-best hypotheses를 만든 뒤, Hugging Face `gpt2` causal language model로 각 후보 문장을 rescoring한다. 이 실험은 모델 학습을 새로 하지 않고 decoding 단계만 바꾼다.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run/wav2vec_inference.py \
+  --model-dir finetuning_output_baseline \
+  --rescore-model gpt2 \
+  --beam-width 25 \
+  --token-beam 20 \
+  --nbest-size 10 \
+  --rescore-alpha 0.5 \
+  --test-clean-output results/gpt2_rescore_test_clean.txt \
+  --test-other-output results/gpt2_rescore_test_other.txt
+```
+
+WER 계산은 각 결과 파일에 대해 동일하게 수행한다.
+
+```bash
+python run/evaluate_wer.py results/baseline_test_clean.txt
+python run/evaluate_wer.py results/baseline_test_other.txt
+```

@@ -8,8 +8,9 @@ __author__ = "Seoyoung Ju(jstandzero@korea.ac.kr)"
 import glob
 import io
 import os
+import random
 import re
-from typing import Dict
+from typing import Dict, Optional
 
 # Third-party imports
 import torch
@@ -25,9 +26,37 @@ processor = AutoProcessor.from_pretrained(PROCESSOR_NAME)
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-def preprocess_sample(sample: Dict) -> Dict:
+def _augment_waveform(
+    waveform: torch.Tensor,
+    noise_std: float = 0.005,
+    noise_prob: float = 0.5,
+    speed_prob: float = 0.3,
+    speed_factors: Optional[list] = None
+) -> torch.Tensor:
+    """Apply lightweight waveform augmentation for training ablations."""
+    if speed_factors is None:
+        speed_factors = [0.9, 1.0, 1.1]
+
+    augmented = waveform
+    if random.random() < speed_prob:
+        speed = random.choice(speed_factors)
+        if speed != 1.0:
+            new_length = max(1, int(augmented.numel() / speed))
+            augmented = torch.nn.functional.interpolate(
+                augmented.view(1, 1, -1),
+                size=new_length,
+                mode="linear",
+                align_corners=False
+            ).view(-1)
+
+    if random.random() < noise_prob and noise_std > 0:
+        augmented = augmented + torch.randn_like(augmented) * noise_std
+
+    return augmented.clamp(-1.0, 1.0)
+
+
+def preprocess_sample(sample: Dict, augment: bool = False) -> Dict:
     """Preprocess one WebDataset sample for Wav2Vec2 CTC training/inference."""
-    # TODO Implement this function
     audio = sample["audio"]
     text = sample["text"]
 
@@ -56,6 +85,9 @@ def preprocess_sample(sample: Dict) -> Dict:
             new_freq=SAMPLE_RATE
         )
 
+    if augment:
+        waveform = _augment_waveform(waveform)
+
     if isinstance(text, bytes):
         transcript = text.decode("utf-8").strip()
     else:
@@ -68,7 +100,6 @@ def preprocess_sample(sample: Dict) -> Dict:
         sampling_rate=SAMPLE_RATE
     ).input_values[0]
     labels = processor(text=transcript).input_ids
-    # End of TODO
 
     return {
         "input_values": input_values,
@@ -78,7 +109,7 @@ def preprocess_sample(sample: Dict) -> Dict:
     }
 
 
-def make_dataset(data_dir: str) -> wds.WebDataset:
+def make_dataset(data_dir: str, augment: bool = False) -> wds.WebDataset:
     """Create a WebDataset pipeline from all tar shards in data_dir."""
     shards = sorted(glob.glob(os.path.join(data_dir, "*.tar")))
     if not shards:
@@ -89,6 +120,6 @@ def make_dataset(data_dir: str) -> wds.WebDataset:
             .rename(audio="audio;wav;flac", text="text;txt;transcript")
             .to_tuple("audio", "text")
             .map(lambda sample: {"audio": sample[0], "text": sample[1]})
-            .map(preprocess_sample)
+            .map(lambda sample: preprocess_sample(sample, augment=augment))
     )
     return dataset
