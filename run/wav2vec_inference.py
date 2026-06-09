@@ -18,7 +18,7 @@ PROJECT_DIR = os.path.dirname(RUN_DIR)
 
 
 def parse_args():
-    """Parse inference and neural language model rescoring options."""
+    """Parse inference and neural language model decoding options."""
     parser = argparse.ArgumentParser(
         description="Run Wav2Vec2 inference on test-clean and test-other."
     )
@@ -32,9 +32,29 @@ def parse_args():
     parser.add_argument("--beam-width", type=int, default=25)
     parser.add_argument("--token-beam", type=int, default=20)
     parser.add_argument("--nbest-size", type=int, default=10)
-    parser.add_argument("--rescore-model", default=None)
-    parser.add_argument("--rescore-alpha", type=float, default=0.5)
-    parser.add_argument("--rescore-beta", type=float, default=0.0)
+    parser.add_argument("--lm-model", default=None)
+    parser.add_argument("--lm-alpha", type=float, default=0.05)
+    parser.add_argument("--word-bonus", type=float, default=0.0)
+    parser.add_argument(
+        "--rescore-model",
+        dest="lm_model",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--rescore-alpha",
+        dest="lm_alpha",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--rescore-beta",
+        dest="word_bonus",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS
+    )
     return parser.parse_args()
 
 
@@ -46,6 +66,8 @@ def validate_args(args) -> None:
         raise ValueError("--token-beam must be positive.")
     if args.nbest_size <= 0:
         raise ValueError("--nbest-size must be positive.")
+    if args.lm_alpha < 0:
+        raise ValueError("--lm-alpha must be non-negative.")
 
 
 def resolve_model_dir(args):
@@ -69,31 +91,51 @@ def logadd(a: float, b: float) -> float:
     return a + math.log1p(math.exp(b - a))
 
 
-class GPT2Rescorer:
-    """Score CTC N-best hypotheses with a Hugging Face causal LM."""
+class CausalLMScorer:
+    """Score partial CTC hypotheses with a Hugging Face causal LM."""
 
     def __init__(self, model_name: str, device: torch.device):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
         self.model.eval()
         self.device = device
+        self.cache = {"": 0.0}
 
     def score(self, text: str) -> float:
         """Return sequence log-likelihood under the causal LM."""
         normalized = text.lower().strip()
+        if normalized in self.cache:
+            return self.cache[normalized]
         if not normalized:
-            return -math.inf
+            return 0.0
 
         encoded = self.tokenizer(normalized, return_tensors="pt")
         input_ids = encoded.input_ids.to(self.device)
         if input_ids.shape[-1] < 2:
+            self.cache[normalized] = 0.0
             return 0.0
 
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, labels=input_ids)
 
         token_count = input_ids.shape[-1] - 1
-        return float(-outputs.loss.item() * token_count)
+        score = float(-outputs.loss.item() * token_count)
+        self.cache[normalized] = score
+        return score
+
+
+def combined_score(
+    beam_state,
+    lm_alpha: float = 0.0,
+    word_bonus: float = 0.0
+) -> float:
+    """Combine CTC, neural LM, and word bonus scores for beam ranking."""
+    prob_blank, prob_non_blank, lm_score, word_count = beam_state
+    return (
+        logadd(prob_blank, prob_non_blank)
+        + lm_alpha * lm_score
+        + word_bonus * word_count
+    )
 
 
 def ctc_prefix_beam_search(
@@ -101,9 +143,12 @@ def ctc_prefix_beam_search(
     processor,
     beam_width: int,
     token_beam: int,
-    nbest_size: int
+    nbest_size: int,
+    lm_scorer=None,
+    lm_alpha: float = 0.0,
+    word_bonus: float = 0.0
 ):
-    """Build CTC N-best hypotheses without an external language model."""
+    """Build CTC N-best hypotheses with optional neural LM shallow fusion."""
     log_probs = torch.nn.functional.log_softmax(logits, dim=-1).cpu()
     blank_id = processor.tokenizer.pad_token_id
     special_token_ids = set(getattr(processor.tokenizer, "all_special_ids", []))
@@ -111,7 +156,19 @@ def ctc_prefix_beam_search(
     word_delimiter_id = getattr(processor.tokenizer, "word_delimiter_token_id", None)
     if word_delimiter_id is not None:
         special_token_ids.discard(word_delimiter_id)
-    beams = {(): (0.0, -math.inf)}
+    prefix_cache = {(): ("", 0.0, 0)}
+    beams = {(): (0.0, -math.inf, 0.0, 0)}
+
+    def get_lm_features(prefix):
+        if prefix not in prefix_cache:
+            text = processor.batch_decode(
+                [list(prefix)],
+                group_tokens=False
+            )[0].strip()
+            lm_score = lm_scorer.score(text) if lm_scorer is not None else 0.0
+            word_count = len(text.split())
+            prefix_cache[prefix] = (text, lm_score, word_count)
+        return prefix_cache[prefix]
 
     for frame in log_probs:
         next_beams = {}
@@ -120,7 +177,7 @@ def ctc_prefix_beam_search(
             k=min(token_beam, frame.shape[-1])
         )
 
-        for prefix, (prob_blank, prob_non_blank) in beams.items():
+        for prefix, (prob_blank, prob_non_blank, lm_score, word_count) in beams.items():
             prefix_score = logadd(prob_blank, prob_non_blank)
 
             for token_score, token_id in zip(top_values.tolist(), top_ids.tolist()):
@@ -128,30 +185,41 @@ def ctc_prefix_beam_search(
                     continue
 
                 if token_id == blank_id:
-                    next_blank, next_non_blank = next_beams.get(
+                    next_blank, next_non_blank, _, _ = next_beams.get(
                         prefix,
-                        (-math.inf, -math.inf)
+                        (-math.inf, -math.inf, lm_score, word_count)
                     )
                     next_blank = logadd(next_blank, prefix_score + token_score)
-                    next_beams[prefix] = (next_blank, next_non_blank)
+                    next_beams[prefix] = (
+                        next_blank,
+                        next_non_blank,
+                        lm_score,
+                        word_count
+                    )
                     continue
 
                 new_prefix = prefix + (token_id,)
-                next_blank, next_non_blank = next_beams.get(
+                _, new_lm_score, new_word_count = get_lm_features(new_prefix)
+                next_blank, next_non_blank, _, _ = next_beams.get(
                     new_prefix,
-                    (-math.inf, -math.inf)
+                    (-math.inf, -math.inf, new_lm_score, new_word_count)
                 )
 
                 if prefix and token_id == prefix[-1]:
-                    same_blank, same_non_blank = next_beams.get(
+                    same_blank, same_non_blank, _, _ = next_beams.get(
                         prefix,
-                        (-math.inf, -math.inf)
+                        (-math.inf, -math.inf, lm_score, word_count)
                     )
                     same_non_blank = logadd(
                         same_non_blank,
                         prob_non_blank + token_score
                     )
-                    next_beams[prefix] = (same_blank, same_non_blank)
+                    next_beams[prefix] = (
+                        same_blank,
+                        same_non_blank,
+                        lm_score,
+                        word_count
+                    )
                     next_non_blank = logadd(
                         next_non_blank,
                         prob_blank + token_score
@@ -162,30 +230,51 @@ def ctc_prefix_beam_search(
                         prefix_score + token_score
                     )
 
-                next_beams[new_prefix] = (next_blank, next_non_blank)
+                next_beams[new_prefix] = (
+                    next_blank,
+                    next_non_blank,
+                    new_lm_score,
+                    new_word_count
+                )
 
         beams = dict(
             sorted(
                 next_beams.items(),
-                key=lambda item: logadd(item[1][0], item[1][1]),
+                key=lambda item: combined_score(
+                    item[1],
+                    lm_alpha=lm_alpha,
+                    word_bonus=word_bonus
+                ),
                 reverse=True
             )[:beam_width]
         )
 
     hypotheses = []
     seen = set()
-    for prefix, (prob_blank, prob_non_blank) in sorted(
+    for prefix, beam_state in sorted(
         beams.items(),
-        key=lambda item: logadd(item[1][0], item[1][1]),
+        key=lambda item: combined_score(
+            item[1],
+            lm_alpha=lm_alpha,
+            word_bonus=word_bonus
+        ),
         reverse=True
     ):
-        text = processor.batch_decode([list(prefix)])[0].strip()
+        prob_blank, prob_non_blank, lm_score, word_count = beam_state
+        text, _, _ = get_lm_features(prefix)
         if text in seen:
             continue
         seen.add(text)
         hypotheses.append({
             "text": text,
-            "acoustic_score": logadd(prob_blank, prob_non_blank)
+            "acoustic_score": logadd(prob_blank, prob_non_blank),
+            "lm_score": lm_score,
+            "word_count": word_count,
+            "score": combined_score(
+                beam_state,
+                lm_alpha=lm_alpha,
+                word_bonus=word_bonus
+            )
         })
         if len(hypotheses) >= nbest_size:
             break
@@ -193,36 +282,17 @@ def ctc_prefix_beam_search(
     return hypotheses
 
 
-def rescore_hypotheses(hypotheses, rescorer, alpha: float, beta: float) -> str:
-    """Select the best hypothesis using acoustic, LM, and length scores."""
-    best_text = ""
-    best_score = -math.inf
-    for hypothesis in hypotheses:
-        text = hypothesis["text"]
-        lm_score = rescorer.score(text)
-        length_score = len(text.split())
-        total_score = (
-            hypothesis["acoustic_score"]
-            + alpha * lm_score
-            + beta * length_score
-        )
-        if total_score > best_score:
-            best_score = total_score
-            best_text = text
-    return best_text
-
-
 def transcribe(
     data,
     processor,
     model,
     device,
-    rescorer=None,
+    lm_scorer=None,
     beam_width=25,
     token_beam=20,
     nbest_size=10,
-    rescore_alpha=0.5,
-    rescore_beta=0.0
+    lm_alpha=0.05,
+    word_bonus=0.0
 ):
     """Transcribe one preprocessed sample without using the ASR pipeline."""
     inputs = processor(
@@ -241,24 +311,22 @@ def transcribe(
             attention_mask=attention_mask
         ).logits
 
-    if rescorer is not None:
+    if lm_scorer is not None:
         hypotheses = ctc_prefix_beam_search(
             logits[0].detach(),
             processor=processor,
             beam_width=beam_width,
             token_beam=token_beam,
-            nbest_size=nbest_size
+            nbest_size=nbest_size,
+            lm_scorer=lm_scorer,
+            lm_alpha=lm_alpha,
+            word_bonus=word_bonus
         )
         if not hypotheses:
             pred_ids = torch.argmax(logits, dim=-1)
             return processor.batch_decode(pred_ids)[0]
 
-        return rescore_hypotheses(
-            hypotheses,
-            rescorer=rescorer,
-            alpha=rescore_alpha,
-            beta=rescore_beta
-        )
+        return hypotheses[0]["text"]
 
     pred_ids = torch.argmax(logits, dim=-1)
     return processor.batch_decode(pred_ids)[0]
@@ -271,7 +339,7 @@ def write_results(
     model,
     device,
     args,
-    rescorer=None
+    lm_scorer=None
 ):
     """Write REF/HYP pairs for a dataset."""
     output_dir = os.path.dirname(output_file)
@@ -286,12 +354,12 @@ def write_results(
                 processor=processor,
                 model=model,
                 device=device,
-                rescorer=rescorer,
+                lm_scorer=lm_scorer,
                 beam_width=args.beam_width,
                 token_beam=args.token_beam,
                 nbest_size=args.nbest_size,
-                rescore_alpha=args.rescore_alpha,
-                rescore_beta=args.rescore_beta
+                lm_alpha=args.lm_alpha,
+                word_bonus=args.word_bonus
             )
             f.write(f"REF: {ref}\n")
             f.write(f"HYP: {hyp}\n\n")
@@ -318,9 +386,9 @@ def main():
     processor = AutoProcessor.from_pretrained(model_dir)
     model = AutoModelForCTC.from_pretrained(model_dir).to(device)
     model.eval()
-    rescorer = None
-    if args.rescore_model:
-        rescorer = GPT2Rescorer(args.rescore_model, device)
+    lm_scorer = None
+    if args.lm_model:
+        lm_scorer = CausalLMScorer(args.lm_model, device)
 
     write_results(
         test_clean_dataset,
@@ -329,7 +397,7 @@ def main():
         model=model,
         device=device,
         args=args,
-        rescorer=rescorer
+        lm_scorer=lm_scorer
     )
     write_results(
         test_other_dataset,
@@ -338,7 +406,7 @@ def main():
         model=model,
         device=device,
         args=args,
-        rescorer=rescorer
+        lm_scorer=lm_scorer
     )
 
 

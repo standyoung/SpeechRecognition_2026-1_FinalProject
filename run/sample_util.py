@@ -10,7 +10,7 @@ import io
 import os
 import random
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Third-party imports
 import torch
@@ -109,12 +109,16 @@ def preprocess_sample(sample: Dict, augment: bool = False) -> Dict:
     }
 
 
-def make_dataset(data_dir: str, augment: bool = False) -> wds.WebDataset:
-    """Create a WebDataset pipeline from all tar shards in data_dir."""
+def _list_shards(data_dir: str) -> List[str]:
+    """Return sorted tar shards in data_dir."""
     shards = sorted(glob.glob(os.path.join(data_dir, "*.tar")))
     if not shards:
         raise FileNotFoundError(f"No tar shards found in {data_dir}")
+    return shards
 
+
+def _make_dataset_from_shards(shards: List[str], augment: bool = False) -> wds.WebDataset:
+    """Create a WebDataset pipeline from explicit tar shards."""
     dataset = (
         wds.WebDataset(shards, shardshuffle=False)
             .rename(audio="audio;wav;flac", text="text;txt;transcript")
@@ -123,3 +127,31 @@ def make_dataset(data_dir: str, augment: bool = False) -> wds.WebDataset:
             .map(lambda sample: preprocess_sample(sample, augment=augment))
     )
     return dataset
+
+
+def make_dataset(data_dir: str, augment: bool = False) -> wds.WebDataset:
+    """Create a WebDataset pipeline from all tar shards in data_dir."""
+    return _make_dataset_from_shards(_list_shards(data_dir), augment=augment)
+
+
+def make_train_val_datasets(
+    data_dir: str,
+    val_ratio: float = 0.2,
+    augment_train: bool = False
+) -> Tuple[wds.WebDataset, wds.WebDataset]:
+    """Split train shards into disjoint train/validation WebDatasets."""
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio must be between 0 and 1.")
+
+    shards = _list_shards(data_dir)
+    val_count = max(1, round(len(shards) * val_ratio))
+    if val_count >= len(shards):
+        raise ValueError(
+            f"Need at least one train shard and one validation shard in {data_dir}."
+        )
+
+    train_shards = shards[:-val_count]
+    val_shards = shards[-val_count:]
+    train_dataset = _make_dataset_from_shards(train_shards, augment=augment_train)
+    val_dataset = _make_dataset_from_shards(val_shards, augment=False)
+    return train_dataset, val_dataset

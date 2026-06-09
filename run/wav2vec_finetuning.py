@@ -28,7 +28,7 @@ def parse_args():
     )
     parser.add_argument("--data-dir", default=os.path.join(PROJECT_DIR, "data"))
     parser.add_argument("--train-split", default="1h")
-    parser.add_argument("--eval-split", default="test-clean")
+    parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--model-name", default="facebook/wav2vec2-base")
     parser.add_argument("--processor-name", default="facebook/wav2vec2-base-960h")
     parser.add_argument("--output-dir", default=os.path.join(PROJECT_DIR, "finetuning_output"))
@@ -66,6 +66,8 @@ def validate_args(args) -> None:
         raise ValueError("--freeze-transformer-layers must be non-negative.")
     if args.max_entropy_weight < 0:
         raise ValueError("--max-entropy-weight must be non-negative.")
+    if not 0.0 < args.val_ratio < 1.0:
+        raise ValueError("--val-ratio must be between 0 and 1.")
 
 
 def build_compute_metrics(processor, wer_metric):
@@ -167,9 +169,11 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
 
     train_top_dir = os.path.join(args.data_dir, args.train_split)
-    test_top_dir = os.path.join(args.data_dir, args.eval_split)
-    train_dataset = sample_util.make_dataset(train_top_dir, augment=args.augment)
-    test_dataset = sample_util.make_dataset(test_top_dir, augment=False)
+    train_dataset, val_dataset = sample_util.make_train_val_datasets(
+        train_top_dir,
+        val_ratio=args.val_ratio,
+        augment_train=args.augment
+    )
     wer_metric = evaluate.load("wer")
 
     data_collator = DataCollatorCTCWithPadding(
@@ -224,7 +228,7 @@ def main():
         "model": model,
         "args": training_args,
         "train_dataset": train_dataset,
-        "eval_dataset": test_dataset,
+        "eval_dataset": val_dataset,
         "data_collator": data_collator,
         "compute_metrics": build_compute_metrics(processor, wer_metric),
         "max_entropy_weight": args.max_entropy_weight,

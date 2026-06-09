@@ -40,6 +40,21 @@ data/
 
 코드에서는 `*.tar` 전체를 정렬해서 읽고, 학습과 평가에 필요한 `audio`, `text`만 사용한다. WebDataset은 `shardshuffle=False`로 설정해 shard 순서를 고정한다.
 
+Fine-tuning 중에는 `test-clean`, `test-other`를 validation으로 사용하지 않는다. 두 split은 최종 inference 및 WER 계산에만 사용한다. 모델 선택을 위한 validation set은 `data/1h` 내부 shard에서 분리한다.
+
+기본 설정(`--val-ratio 0.2`)에서는 `data/1h`의 5개 shard 중 마지막 1개 shard를 validation으로 사용한다.
+
+```text
+data/1h/
+  shard-000000.tar  -> train
+  shard-000001.tar  -> train
+  shard-000002.tar  -> train
+  shard-000003.tar  -> train
+  shard-000004.tar  -> validation
+```
+
+validation split은 학습 중 `eval_steps`마다 WER를 계산하고 best checkpoint를 선택하는 용도로만 사용한다. 학습 augmentation을 켜더라도 validation에는 augmentation을 적용하지 않는다.
+
 ## 전처리 방법
 
 `run/sample_util.py`는 한 sample을 다음 방식으로 변환한다.
@@ -113,27 +128,28 @@ fp16은 기본적으로 끄고 fp32 + TF32로 학습한다. fp16을 실험하려
 
 ## Evaluation 방법
 
-fine-tuning 중 `test-clean`을 eval dataset으로 사용한다. 모델 output logits에서 `argmax`로 token id를 고르고, processor로 text를 decode한다. reference label은 `-100`을 pad token id로 복원한 뒤 decode한다. 이후 `evaluate.load("wer")`로 WER를 계산한다.
+fine-tuning 중에는 `data/1h`에서 분리한 validation shard를 eval dataset으로 사용한다. 기본 설정에서는 `shard-000004.tar`가 validation set이다. 모델 output logits에서 `argmax`로 token id를 고르고, processor로 text를 decode한다. reference label은 `-100`을 pad token id로 복원한 뒤 decode한다. 이후 `evaluate.load("wer")`로 WER를 계산한다.
 
-best checkpoint는 WER가 낮은 모델을 기준으로 선택한다.
+best checkpoint는 validation WER가 낮은 모델을 기준으로 선택한다.
 
 ```text
 metric_for_best_model = wer
 greater_is_better = False
 ```
 
+`test-clean`과 `test-other`는 fine-tuning 중 eval dataset이나 checkpoint 선택에 사용하지 않고, 학습이 끝난 뒤 최종 test WER를 계산할 때만 사용한다.
+
 ## Inference 방법
 
 `run/wav2vec_inference.py`는 기본적으로 `finetuning_output/`에 저장된 fine-tuned model을 사용한다. 아직 학습된 모델이 없으면 baseline inference를 위해 `PROCESSOR_NAME` checkpoint로 fallback한다.
 
-pipeline에는 feature-extracted `input_values`가 아니라 raw audio array를 넘긴다.
+기본 추론은 외부 language model 없이 CTC greedy decoding을 사용한다. `--lm-model`을 지정하면 CTC prefix beam search 안에서 Hugging Face causal language model 점수를 함께 사용하는 neural LM shallow fusion decoding을 수행한다.
 
-```python
-{
-    "array": data["speech"],
-    "sampling_rate": data["sampling_rate"],
-}
+```text
+score = ctc_score + lm_alpha * lm_score + word_bonus * word_count
 ```
+
+shallow fusion을 사용할 때 prefix text는 이미 CTC prefix beam search가 collapse한 token sequence이므로, decoding 시 `group_tokens=False`를 사용해 반복 문자(`LL`, `EE` 등)가 다시 collapse되지 않게 한다.
 
 결과는 프로젝트 루트에 저장된다.
 
@@ -185,6 +201,15 @@ python run/evaluate_wer.py test_other_result.txt
 - `loss=0`, `grad_norm=nan`이 같이 나오면 정상 학습이 아니므로 run을 중단하고 기본 fp32 설정과 `apply_spec_augment=False` 설정을 확인한다.
 - ablation study를 위해 주요 실험 옵션은 command line argument로 제어한다.
 
+## 현재 코드 변경 요약
+
+- Fine-tuning 중 `test-clean`, `test-other`를 eval dataset으로 사용하지 않는다.
+- `data/1h` shard를 train/validation으로 분리하고, validation WER 기준으로 best checkpoint를 선택한다.
+- 기본 `--val-ratio 0.2`에서는 `shard-000000.tar`부터 `shard-000003.tar`까지 train, `shard-000004.tar`를 validation으로 사용한다.
+- 기존 N-best rescoring 방식은 neural LM shallow fusion으로 대체했다.
+- Shallow fusion은 `--lm-model`, `--lm-alpha`, `--word-bonus` 옵션으로 제어한다.
+- 기존 WER 수치는 split과 decoding 방식 변경 전 결과이므로 재실험이 필요하다.
+
 ## Baseline 요약
 
 `run/` 폴더의 현재 baseline은 `facebook/wav2vec2-base`에서 시작해 LibriSpeech 1h shard로 CTC fine-tuning을 수행하는 구성이다.
@@ -200,29 +225,29 @@ python run/evaluate_wer.py test_other_result.txt
 
 ```bash
 python run/evaluate_wer.py test_clean_result.txt
-# WER: 0.2364
+# WER: TBD
 
 python run/evaluate_wer.py test_other_result.txt
-# WER: 0.3459
+# WER: TBD
 ```
 
 | Evaluation set | WER |
 | --- | ---: |
-| test-clean | 0.2364 |
-| test-other | 0.3459 |
+| test-clean | TBD |
+| test-other | TBD |
 
 ## Ablation Study 계획
 
-다음 실험은 같은 train/evaluation split을 사용하고, `test-clean`과 `test-other` WER를 비교한다. 아무 ablation option도 주지 않고 `python run/wav2vec_finetuning.py`를 실행하면 기본 설정이 baseline이다. 결과 파일명과 output directory를 분리해두면 실험별 결과를 쉽게 업데이트할 수 있다.
+다음 실험은 같은 train/validation split을 사용하고, 학습 완료 후 `test-clean`과 `test-other` WER를 비교한다. 아무 ablation option도 주지 않고 `python run/wav2vec_finetuning.py`를 실행하면 기본 설정이 baseline이다. 결과 파일명과 output directory를 분리해두면 실험별 결과를 쉽게 업데이트할 수 있다.
 
 | Experiment | Training option | Decoding option | test-clean WER | test-other WER | Notes |
 | --- | --- | --- | ---: | ---: | --- |
-| Baseline | default CTC fine-tuning | greedy decoding | 0.2364 | 0.3459 | `wav2vec2 CTC greedy decoding` |
-| Ablation 1 | `--augment` | greedy decoding | 0.2244 | 0.3283 | data augmentation |
-| Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | 0.2184 | 0.2948 | frozen encoder layers |
-| Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | 0.2232 | 0.3293 | maximum entropy regularization |
-| Ablation 4 | default CTC fine-tuning | `--rescore-model gpt2` | 0.2703 | 0.3679 | GPT-2 neural LM rescoring |
-| Ablation 1+2+3+4 | `--augment` + `--freeze-transformer-layers 6` + `--max-entropy-weight 0.01` | `--rescore-model gpt2` | TBD | TBD | combined training + decoding setting |
+| Baseline | default CTC fine-tuning | greedy decoding | TBD | TBD | `wav2vec2 CTC greedy decoding` |
+| Ablation 1 | `--augment` | greedy decoding | TBD | TBD | data augmentation |
+| Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | TBD | TBD | frozen encoder layers |
+| Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | TBD | TBD | maximum entropy regularization |
+| Ablation 4 | default CTC fine-tuning | `--lm-model facebook/opt-125m` | TBD | TBD | neural LM shallow fusion |
+| Ablation 1+2+3+4 | `--augment` + `--freeze-transformer-layers 6` + `--max-entropy-weight 0.01` | `--lm-model facebook/opt-125m` | TBD | TBD | combined training + decoding setting |
 
 ### Ablation 학습 명령어
 
@@ -249,24 +274,25 @@ python run/wav2vec_finetuning.py \
   --output-dir finetuning_output_maxent001
 ```
 
-GPT-2 neural LM rescoring은 학습 ablation이 아니라 decoding ablation이므로, baseline checkpoint를 사용해 inference 단계에서 적용한다.
+Neural LM shallow fusion은 학습 ablation이 아니라 decoding ablation이므로, baseline checkpoint를 사용해 inference 단계에서 적용한다.
 
 ```bash
-# Ablation 4: + GPT-2 neural LM rescoring
+# Ablation 4: + neural LM shallow fusion
 python run/wav2vec_inference.py \
   --model-dir finetuning_output_baseline \
-  --rescore-model gpt2 \
+  --lm-model facebook/opt-125m \
   --beam-width 25 \
   --token-beam 20 \
   --nbest-size 10 \
-  --rescore-alpha 0.5 \
-  --test-clean-output results/baseline_gpt2_rescore_test_clean.txt \
-  --test-other-output results/baseline_gpt2_rescore_test_other.txt
+  --lm-alpha 0.05 \
+  --word-bonus 0.0 \
+  --test-clean-output results/baseline_lm_fusion_test_clean.txt \
+  --test-other-output results/baseline_lm_fusion_test_other.txt
 ```
 
 ### All combined: Ablation 1 + 2 + 3 + 4
 
-아래 명령은 data augmentation, frozen encoder layers, maximum entropy regularization, GPT-2 neural LM rescoring을 모두 함께 적용하는 조합 실험이다.
+아래 명령은 data augmentation, frozen encoder layers, maximum entropy regularization, neural LM shallow fusion을 모두 함께 적용하는 조합 실험이다.
 
 ```bash
 # Train with Ablation 1 + 2 + 3
@@ -279,11 +305,12 @@ python run/wav2vec_finetuning.py \
 # Inference with Ablation 4 on the combined checkpoint
 python run/wav2vec_inference.py \
   --model-dir finetuning_output_all \
-  --rescore-model gpt2 \
+  --lm-model facebook/opt-125m \
   --beam-width 25 \
   --token-beam 20 \
   --nbest-size 10 \
-  --rescore-alpha 0.5 \
+  --lm-alpha 0.05 \
+  --word-bonus 0.0 \
   --test-clean-output results/all_test_clean.txt \
   --test-other-output results/all_test_other.txt
 ```
@@ -347,20 +374,27 @@ python run/wav2vec_inference.py \
   --test-other-output results/maxent001_test_other.txt
 ```
 
-### Ablation 4: GPT-2 neural LM rescoring
+### Ablation 4: neural LM shallow fusion
 
-기본 CTC 모델의 logits에서 N-best hypotheses를 만든 뒤, Hugging Face `gpt2` causal language model로 각 후보 문장을 rescoring한다. 이 실험은 모델 학습을 새로 하지 않고 decoding 단계만 바꾼다.
+기본 CTC 모델의 prefix beam search 안에서 Hugging Face `facebook/opt-125m` causal language model 점수를 함께 사용한다. 각 prefix의 decoding score는 acoustic CTC score, neural LM log-likelihood, word bonus를 결합한다.
+
+```text
+score = ctc_score + lm_alpha * lm_score + word_bonus * word_count
+```
+
+이 방식은 N-best 후보를 만든 뒤 후처리로 재정렬하는 rescoring이 아니라, beam search 중 prefix pruning과 최종 선택에 language model이 직접 관여하는 shallow fusion decoding이다. 이 실험은 모델 학습을 새로 하지 않고 decoding 단계만 바꾼다.
 
 ```bash
 python run/wav2vec_inference.py \
   --model-dir finetuning_output_baseline \
-  --rescore-model gpt2 \
+  --lm-model facebook/opt-125m \
   --beam-width 25 \
   --token-beam 20 \
   --nbest-size 10 \
-  --rescore-alpha 0.5 \
-  --test-clean-output results/gpt2_rescore_test_clean.txt \
-  --test-other-output results/gpt2_rescore_test_other.txt
+  --lm-alpha 0.05 \
+  --word-bonus 0.0 \
+  --test-clean-output results/lm_fusion_test_clean.txt \
+  --test-other-output results/lm_fusion_test_other.txt
 ```
 
 WER 계산은 각 결과 파일에 대해 동일하게 수행한다.
