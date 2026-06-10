@@ -11,6 +11,7 @@ import os
 
 # Third-party imports
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoModelForCTC, AutoProcessor, AutoTokenizer
 
 RUN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -95,13 +96,16 @@ class CausalLMScorer:
     """Score partial CTC hypotheses with a Hugging Face causal LM."""
 
     def __init__(self, model_name: str, device: torch.device):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        lm_dtype = torch.float16 if device.type == "cuda" else None
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             use_safetensors=True,
+            torch_dtype=lm_dtype,
         ).to(device)
         self.model.eval()
         self.device = device
+        self.use_amp = device.type == "cuda"
         self.cache = {"": 0.0}
 
     def score(self, text: str) -> float:
@@ -118,8 +122,12 @@ class CausalLMScorer:
             self.cache[normalized] = 0.0
             return 0.0
 
-        with torch.no_grad():
-            outputs = self.model(input_ids=input_ids, labels=input_ids)
+        with torch.inference_mode():
+            if self.use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = self.model(input_ids=input_ids, labels=input_ids)
+            else:
+                outputs = self.model(input_ids=input_ids, labels=input_ids)
 
         token_count = input_ids.shape[-1] - 1
         score = float(-outputs.loss.item() * token_count)
@@ -342,15 +350,19 @@ def write_results(
     model,
     device,
     args,
-    lm_scorer=None
+    lm_scorer=None,
+    split_name="dataset"
 ):
     """Write REF/HYP pairs for a dataset."""
     output_dir = os.path.dirname(output_file)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    total_samples = len(dataset) if hasattr(dataset, "__len__") else None
+    progress_desc = f"Decoding {split_name}"
+
     with open(output_file, "w", encoding="utf-8") as f:
-        for data in dataset:
+        for data in tqdm(dataset, total=total_samples, desc=progress_desc, unit="utt"):
             ref = processor.decode(data["labels"], group_tokens=False)
             hyp = transcribe(
                 data,
@@ -400,7 +412,8 @@ def main():
         model=model,
         device=device,
         args=args,
-        lm_scorer=lm_scorer
+        lm_scorer=lm_scorer,
+        split_name=args.test_clean_split
     )
     write_results(
         test_other_dataset,
@@ -409,7 +422,8 @@ def main():
         model=model,
         device=device,
         args=args,
-        lm_scorer=lm_scorer
+        lm_scorer=lm_scorer,
+        split_name=args.test_other_split
     )
 
 
