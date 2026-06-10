@@ -35,7 +35,9 @@ def parse_args():
     parser.add_argument("--nbest-size", type=int, default=10)
     parser.add_argument("--lm-model", default=None)
     parser.add_argument("--lm-alpha", type=float, default=0.05)
+    parser.add_argument("--lm-batch-size", type=int, default=512)
     parser.add_argument("--word-bonus", type=float, default=0.0)
+    parser.add_argument("--no-lm-progress", action="store_true")
     parser.add_argument(
         "--rescore-model",
         dest="lm_model",
@@ -69,6 +71,8 @@ def validate_args(args) -> None:
         raise ValueError("--nbest-size must be positive.")
     if args.lm_alpha < 0:
         raise ValueError("--lm-alpha must be non-negative.")
+    if args.lm_batch_size <= 0:
+        raise ValueError("--lm-batch-size must be positive.")
 
 
 def resolve_model_dir(args):
@@ -95,7 +99,7 @@ def logadd(a: float, b: float) -> float:
 class CausalLMScorer:
     """Score partial CTC hypotheses with a Hugging Face causal LM."""
 
-    def __init__(self, model_name: str, device: torch.device):
+    def __init__(self, model_name: str, device: torch.device, batch_size: int = 512):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -110,6 +114,7 @@ class CausalLMScorer:
         self.model.eval()
         self.device = device
         self.use_amp = device.type == "cuda"
+        self.batch_size = batch_size
         self.cache = {"": 0.0}
 
     def score(self, text: str) -> float:
@@ -131,9 +136,10 @@ class CausalLMScorer:
             elif normalized not in pending_texts:
                 pending_texts.append(normalized)
 
-        if pending_texts:
+        for start in range(0, len(pending_texts), self.batch_size):
+            batch_texts = pending_texts[start:start + self.batch_size]
             encoded = self.tokenizer(
-                pending_texts,
+                batch_texts,
                 return_tensors="pt",
                 padding=True
             )
@@ -164,7 +170,7 @@ class CausalLMScorer:
             ).sum(dim=-1)
 
             for text, token_count, score in zip(
-                pending_texts,
+                batch_texts,
                 token_counts.tolist(),
                 sequence_scores.tolist()
             ):
@@ -199,10 +205,20 @@ def ctc_prefix_beam_search(
     nbest_size: int,
     lm_scorer=None,
     lm_alpha: float = 0.0,
-    word_bonus: float = 0.0
+    word_bonus: float = 0.0,
+    show_progress: bool = False,
+    progress_desc: str = "LM beam"
 ):
     """Build CTC N-best hypotheses with optional neural LM shallow fusion."""
-    log_probs = torch.nn.functional.log_softmax(logits, dim=-1).cpu()
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    frame_count = log_probs.shape[0]
+    top_values_by_frame, top_ids_by_frame = torch.topk(
+        log_probs,
+        k=min(token_beam, log_probs.shape[-1]),
+        dim=-1
+    )
+    top_values_by_frame = top_values_by_frame.cpu()
+    top_ids_by_frame = top_ids_by_frame.cpu()
     blank_id = processor.tokenizer.pad_token_id
     special_token_ids = set(getattr(processor.tokenizer, "all_special_ids", []))
     special_token_ids.discard(blank_id)
@@ -236,13 +252,25 @@ def ctc_prefix_beam_search(
                 len(text.split())
             )
 
-    for frame in log_probs:
+    progress_bar = None
+    frame_iter = range(frame_count)
+    if show_progress:
+        progress_bar = tqdm(
+            range(frame_count),
+            total=frame_count,
+            desc=progress_desc,
+            unit="frm",
+            position=1,
+            leave=False,
+            dynamic_ncols=True
+        )
+        frame_iter = progress_bar
+
+    for frame_idx in frame_iter:
         next_beams = {}
         pending_lm_prefixes = set()
-        top_values, top_ids = torch.topk(
-            frame,
-            k=min(token_beam, frame.shape[-1])
-        )
+        top_values = top_values_by_frame[frame_idx]
+        top_ids = top_ids_by_frame[frame_idx]
 
         for prefix, (prob_blank, prob_non_blank, lm_score, word_count) in beams.items():
             prefix_score = logadd(prob_blank, prob_non_blank)
@@ -319,6 +347,14 @@ def ctc_prefix_beam_search(
                 reverse=True
             )[:beam_width]
         )
+        if progress_bar is not None and (
+            frame_idx % 25 == 0 or frame_idx + 1 == frame_count
+        ):
+            progress_bar.set_postfix(
+                beams=len(beams),
+                lm_pending=len(pending_lm_prefixes),
+                lm_cache=len(lm_scorer.cache) if lm_scorer is not None else 0
+            )
 
     final_items = []
     final_prefixes = []
@@ -389,7 +425,9 @@ def transcribe(
     token_beam=20,
     nbest_size=10,
     lm_alpha=0.05,
-    word_bonus=0.0
+    word_bonus=0.0,
+    show_progress=False,
+    progress_desc="LM beam"
 ):
     """Transcribe one preprocessed sample without using the ASR pipeline."""
     inputs = processor(
@@ -417,7 +455,9 @@ def transcribe(
             nbest_size=nbest_size,
             lm_scorer=lm_scorer,
             lm_alpha=lm_alpha,
-            word_bonus=word_bonus
+            word_bonus=word_bonus,
+            show_progress=show_progress,
+            progress_desc=progress_desc
         )
         if not hypotheses:
             pred_ids = torch.argmax(logits, dim=-1)
@@ -448,7 +488,14 @@ def write_results(
     progress_desc = f"Decoding {split_name}"
 
     with open(output_file, "w", encoding="utf-8") as f:
-        for data in tqdm(dataset, total=total_samples, desc=progress_desc, unit="utt"):
+        for utt_idx, data in enumerate(tqdm(
+            dataset,
+            total=total_samples,
+            desc=progress_desc,
+            unit="utt",
+            position=0,
+            dynamic_ncols=True
+        ), start=1):
             ref = processor.decode(data["labels"], group_tokens=False)
             hyp = transcribe(
                 data,
@@ -460,7 +507,9 @@ def write_results(
                 token_beam=args.token_beam,
                 nbest_size=args.nbest_size,
                 lm_alpha=args.lm_alpha,
-                word_bonus=args.word_bonus
+                word_bonus=args.word_bonus,
+                show_progress=lm_scorer is not None and not args.no_lm_progress,
+                progress_desc=f"{split_name} utt {utt_idx} LM"
             )
             f.write(f"REF: {ref}\n")
             f.write(f"HYP: {hyp}\n\n")
@@ -489,7 +538,11 @@ def main():
     model.eval()
     lm_scorer = None
     if args.lm_model:
-        lm_scorer = CausalLMScorer(args.lm_model, device)
+        lm_scorer = CausalLMScorer(
+            args.lm_model,
+            device,
+            batch_size=args.lm_batch_size
+        )
 
     write_results(
         test_clean_dataset,

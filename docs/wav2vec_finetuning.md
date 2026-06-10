@@ -147,13 +147,15 @@ greater_is_better = False
 
 Neural LM shallow fusion은 beam search 중 후보 점수에 LM log-likelihood를 직접 더해 prefix pruning과 최종 선택에 반영한다. 이전처럼 모든 character prefix마다 OPT를 호출하면 `frame 수 * beam width * token beam` 규모로 LM forward가 발생해 매우 느려진다. 현재 구현은 속도를 위해 단어 경계 후보가 생길 때만 LM 점수를 batch로 갱신하고, 각 utterance 마지막 후보는 최종 선택 전에 한 번 더 scoring한다.
 
+`--lm-model`을 사용할 때는 dataset 단위 tqdm 아래에 utterance 내부 CTC frame 진행률도 표시된다. 내부 진행바에는 현재 beam 수, 이번 frame에서 LM scoring 대상이 된 prefix 수, LM cache 크기가 함께 표시된다. 진행바가 너무 많으면 `--no-lm-progress`로 끌 수 있다.
+
 ```text
 score = ctc_score + lm_alpha * lm_score + word_bonus * word_count
 ```
 
 shallow fusion을 사용할 때 prefix text는 이미 CTC prefix beam search가 collapse한 token sequence이므로, decoding 시 `group_tokens=False`를 사용해 반복 문자(`LL`, `EE` 등)가 다시 collapse되지 않게 한다.
 
-속도가 더 필요하면 `--beam-width`와 `--token-beam`을 줄인다. 두 값이 클수록 acoustic 후보가 많아지고, 단어 경계에서 batch scoring해야 하는 LM 후보도 늘어난다.
+속도가 더 필요하면 `--beam-width`와 `--token-beam`을 줄인다. 두 값이 클수록 acoustic 후보가 많아지고, 단어 경계에서 batch scoring해야 하는 LM 후보도 늘어난다. `--lm-batch-size`는 neural LM scoring의 최대 batch 크기이며 기본값은 `512`다. GPU memory가 충분한데 사용률이 낮으면 값을 키워볼 수 있다.
 
 결과는 프로젝트 루트에 저장된다.
 
@@ -213,6 +215,7 @@ python run/evaluate_wer.py test_other_result.txt
 - 기존 N-best rescoring 방식은 neural LM shallow fusion으로 대체했다.
 - Shallow fusion은 `--lm-model`, `--lm-alpha`, `--word-bonus` 옵션으로 제어한다.
 - Neural LM score는 모든 character prefix가 아니라 단어 경계 후보에서 batch로 계산해 inference 속도를 개선한다.
+- LM decoding 중 utterance 내부 frame 진행률을 tqdm으로 표시하고, `--lm-batch-size`로 LM scoring batch 크기를 조절할 수 있다.
 - 기존 WER 수치는 split과 decoding 방식 변경 전 결과이므로 재실험이 필요하다.
 
 ## Baseline 요약
@@ -291,6 +294,7 @@ python run/wav2vec_inference.py \
   --token-beam 20 \
   --nbest-size 10 \
   --lm-alpha 0.05 \
+  --lm-batch-size 512 \
   --word-bonus 0.0 \
   --test-clean-output results/baseline_lm_fusion_test_clean.txt \
   --test-other-output results/baseline_lm_fusion_test_other.txt
@@ -316,6 +320,7 @@ python run/wav2vec_inference.py \
   --token-beam 20 \
   --nbest-size 10 \
   --lm-alpha 0.05 \
+  --lm-batch-size 512 \
   --word-bonus 0.0 \
   --test-clean-output results/all_test_clean.txt \
   --test-other-output results/all_test_other.txt
@@ -384,7 +389,7 @@ python run/wav2vec_inference.py \
 
 기본 CTC 모델의 prefix beam search 안에서 Hugging Face `facebook/opt-125m` causal language model 점수를 함께 사용한다. 각 prefix의 decoding score는 acoustic CTC score, neural LM log-likelihood, word bonus를 결합한다.
 
-Neural LM은 매 character prefix마다 호출하지 않고, 단어 경계 후보를 batch로 scoring해 decoding 속도를 유지한다. 마지막 단어처럼 아직 trailing word delimiter가 붙지 않은 후보는 utterance 종료 후 최종 후보 ranking 전에 한 번 더 LM scoring한다.
+Neural LM은 매 character prefix마다 호출하지 않고, 단어 경계 후보를 batch로 scoring해 decoding 속도를 유지한다. 마지막 단어처럼 아직 trailing word delimiter가 붙지 않은 후보는 utterance 종료 후 최종 후보 ranking 전에 한 번 더 LM scoring한다. LM decoding 중에는 utterance 내부 frame 진행률을 tqdm으로 확인할 수 있고, `--lm-batch-size`로 LM scoring batch 크기를 조절할 수 있다.
 
 ```text
 score = ctc_score + lm_alpha * lm_score + word_bonus * word_count
@@ -400,6 +405,7 @@ python run/wav2vec_inference.py \
   --token-beam 20 \
   --nbest-size 10 \
   --lm-alpha 0.05 \
+  --lm-batch-size 512 \
   --word-bonus 0.0 \
   --test-clean-output results/lm_fusion_test_clean.txt \
   --test-other-output results/lm_fusion_test_other.txt
