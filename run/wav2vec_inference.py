@@ -97,12 +97,16 @@ class CausalLMScorer:
 
     def __init__(self, model_name: str, device: torch.device):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         lm_dtype = torch.float16 if device.type == "cuda" else None
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             use_safetensors=True,
             torch_dtype=lm_dtype,
         ).to(device)
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.eval()
         self.device = device
         self.use_amp = device.type == "cuda"
@@ -110,29 +114,67 @@ class CausalLMScorer:
 
     def score(self, text: str) -> float:
         """Return sequence log-likelihood under the causal LM."""
-        normalized = text.lower().strip()
-        if normalized in self.cache:
-            return self.cache[normalized]
-        if not normalized:
-            return 0.0
+        return self.score_many([text])[0]
 
-        encoded = self.tokenizer(normalized, return_tensors="pt")
-        input_ids = encoded.input_ids.to(self.device)
-        if input_ids.shape[-1] < 2:
-            self.cache[normalized] = 0.0
-            return 0.0
+    def score_many(self, texts):
+        """Return sequence log-likelihoods under the causal LM."""
+        normalized_texts = [text.lower().strip() for text in texts]
+        scores = [None] * len(normalized_texts)
+        pending_texts = []
 
-        with torch.inference_mode():
-            if self.use_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    outputs = self.model(input_ids=input_ids, labels=input_ids)
-            else:
-                outputs = self.model(input_ids=input_ids, labels=input_ids)
+        for idx, normalized in enumerate(normalized_texts):
+            if normalized in self.cache:
+                scores[idx] = self.cache[normalized]
+            elif not normalized:
+                self.cache[normalized] = 0.0
+                scores[idx] = 0.0
+            elif normalized not in pending_texts:
+                pending_texts.append(normalized)
 
-        token_count = input_ids.shape[-1] - 1
-        score = float(-outputs.loss.item() * token_count)
-        self.cache[normalized] = score
-        return score
+        if pending_texts:
+            encoded = self.tokenizer(
+                pending_texts,
+                return_tensors="pt",
+                padding=True
+            )
+            input_ids = encoded.input_ids.to(self.device)
+            attention_mask = encoded.attention_mask.to(self.device)
+
+            with torch.inference_mode():
+                if self.use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        logits = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask
+                        ).logits
+                else:
+                    logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    ).logits
+
+            token_counts = attention_mask[:, 1:].sum(dim=-1)
+            log_probs = torch.nn.functional.log_softmax(logits[:, :-1, :], dim=-1)
+            token_log_probs = log_probs.gather(
+                dim=-1,
+                index=input_ids[:, 1:].unsqueeze(-1)
+            ).squeeze(-1)
+            sequence_scores = (
+                token_log_probs * attention_mask[:, 1:]
+            ).sum(dim=-1)
+
+            for text, token_count, score in zip(
+                pending_texts,
+                token_counts.tolist(),
+                sequence_scores.tolist()
+            ):
+                self.cache[text] = float(score) if token_count > 0 else 0.0
+
+        for idx, normalized in enumerate(normalized_texts):
+            if scores[idx] is None:
+                scores[idx] = self.cache[normalized]
+
+        return scores
 
 
 def combined_score(
@@ -167,22 +209,36 @@ def ctc_prefix_beam_search(
     word_delimiter_id = getattr(processor.tokenizer, "word_delimiter_token_id", None)
     if word_delimiter_id is not None:
         special_token_ids.discard(word_delimiter_id)
-    prefix_cache = {(): ("", 0.0, 0)}
+    text_cache = {(): ""}
     beams = {(): (0.0, -math.inf, 0.0, 0)}
 
-    def get_lm_features(prefix):
-        if prefix not in prefix_cache:
+    def decode_prefix(prefix):
+        if prefix not in text_cache:
             text = processor.batch_decode(
                 [list(prefix)],
                 group_tokens=False
             )[0].strip()
-            lm_score = lm_scorer.score(text) if lm_scorer is not None else 0.0
-            word_count = len(text.split())
-            prefix_cache[prefix] = (text, lm_score, word_count)
-        return prefix_cache[prefix]
+            text_cache[prefix] = text
+        return text_cache[prefix]
+
+    def apply_lm_scores(next_beams, prefixes):
+        if lm_scorer is None or not prefixes:
+            return
+        scored_prefixes = [prefix for prefix in prefixes if prefix in next_beams]
+        texts = [decode_prefix(prefix) for prefix in scored_prefixes]
+        lm_scores = lm_scorer.score_many(texts)
+        for prefix, text, lm_score in zip(scored_prefixes, texts, lm_scores):
+            prob_blank, prob_non_blank, _, _ = next_beams[prefix]
+            next_beams[prefix] = (
+                prob_blank,
+                prob_non_blank,
+                lm_score,
+                len(text.split())
+            )
 
     for frame in log_probs:
         next_beams = {}
+        pending_lm_prefixes = set()
         top_values, top_ids = torch.topk(
             frame,
             k=min(token_beam, frame.shape[-1])
@@ -210,7 +266,10 @@ def ctc_prefix_beam_search(
                     continue
 
                 new_prefix = prefix + (token_id,)
-                _, new_lm_score, new_word_count = get_lm_features(new_prefix)
+                new_lm_score = lm_score
+                new_word_count = word_count
+                if token_id == word_delimiter_id:
+                    pending_lm_prefixes.add(new_prefix)
                 next_blank, next_non_blank, _, _ = next_beams.get(
                     new_prefix,
                     (-math.inf, -math.inf, new_lm_score, new_word_count)
@@ -248,6 +307,7 @@ def ctc_prefix_beam_search(
                     new_word_count
                 )
 
+        apply_lm_scores(next_beams, pending_lm_prefixes)
         beams = dict(
             sorted(
                 next_beams.items(),
@@ -260,19 +320,45 @@ def ctc_prefix_beam_search(
             )[:beam_width]
         )
 
+    final_items = []
+    final_prefixes = []
+    final_texts = []
+    for prefix in beams:
+        final_prefixes.append(prefix)
+        final_texts.append(decode_prefix(prefix))
+
+    final_lm_scores = (
+        lm_scorer.score_many(final_texts)
+        if lm_scorer is not None
+        else [beam_state[2] for beam_state in beams.values()]
+    )
+    for prefix, beam_state, text, lm_score in zip(
+        final_prefixes,
+        beams.values(),
+        final_texts,
+        final_lm_scores
+    ):
+        prob_blank, prob_non_blank, _, _ = beam_state
+        final_state = (
+            prob_blank,
+            prob_non_blank,
+            lm_score,
+            len(text.split())
+        )
+        final_items.append((prefix, text, final_state))
+
     hypotheses = []
     seen = set()
-    for prefix, beam_state in sorted(
-        beams.items(),
+    for _, text, beam_state in sorted(
+        final_items,
         key=lambda item: combined_score(
-            item[1],
+            item[2],
             lm_alpha=lm_alpha,
             word_bonus=word_bonus
         ),
         reverse=True
     ):
         prob_blank, prob_non_blank, lm_score, word_count = beam_state
-        text, _, _ = get_lm_features(prefix)
         if text in seen:
             continue
         seen.add(text)
