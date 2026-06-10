@@ -96,7 +96,10 @@ class CausalLMScorer:
 
     def __init__(self, model_name: str, device: torch.device):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            use_safetensors=True,
+        ).to(device)
         self.model.eval()
         self.device = device
         self.cache = {"": 0.0}
