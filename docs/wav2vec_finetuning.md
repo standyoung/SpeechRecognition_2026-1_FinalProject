@@ -242,11 +242,12 @@ python run/evaluate_wer.py test_other_result.txt
 
 | Experiment | Training option | Decoding option | test-clean WER | test-other WER | Notes |
 | --- | --- | --- | ---: | ---: | --- |
-| Baseline | default CTC fine-tuning | greedy decoding | TBD | TBD | `wav2vec2 CTC greedy decoding` |
-| Ablation 1 | `--augment` | greedy decoding | TBD | TBD | data augmentation |
-| Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | TBD | TBD | frozen encoder layers |
-| Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | TBD | TBD | maximum entropy regularization |
+| Baseline | default CTC fine-tuning | greedy decoding | 0.2800 | 0.4035 | `wav2vec2 CTC greedy decoding` |
+| Ablation 1 | `--augment` | greedy decoding | 0.2434 | 0.3417 | data augmentation |
+| Ablation 2 | `--freeze-transformer-layers 6` | greedy decoding | 0.2439 | 0.3219 | frozen encoder layers |
+| Ablation 3 | `--max-entropy-weight 0.01` | greedy decoding | 0.2553 | 0.3667 | maximum entropy regularization |
 | Ablation 4 | default CTC fine-tuning | `--lm-model facebook/opt-125m` | TBD | TBD | neural LM shallow fusion |
+| Ablation 1+2+3 | `--augment` + `--freeze-transformer-layers 6` + `--max-entropy-weight 0.01` | greedy decoding | 0.2316 | 0.3005 | combined training |
 | Ablation 1+2+3+4 | `--augment` + `--freeze-transformer-layers 6` + `--max-entropy-weight 0.01` | `--lm-model facebook/opt-125m` | TBD | TBD | combined training + decoding setting |
 
 ### Ablation 학습 명령어
