@@ -10,3 +10,5 @@ __pycache__
 *.safetensors
 *.bin
 *.json
+
+*.txt
